@@ -3,12 +3,17 @@
 
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover" />
   <title>SplashParty (WebGPU)</title>
   <style>
+    :root {
+      --app-height: 100dvh;
+    }
+
     html,
     body {
       margin: 0;
+      width: 100%;
       height: 100%;
       overflow: hidden;
       background: #101018;
@@ -16,9 +21,25 @@
       font-family: system-ui, sans-serif;
     }
 
+    body {
+      min-height: var(--app-height);
+      position: relative;
+      touch-action: none;
+      overscroll-behavior: none;
+    }
+
+    #splashparty-canvas {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: var(--app-height);
+      display: block;
+    }
+
     #overlay {
       position: fixed;
       inset: 0;
+      z-index: 2;
       align-items: center;
       justify-content: center;
       display: flex;
@@ -26,29 +47,56 @@
       flex-direction: column;
       gap: 0.5rem;
       text-align: center;
-      padding: 1rem;
+      padding:
+        max(1rem, env(safe-area-inset-top))
+        max(1rem, env(safe-area-inset-right))
+        max(1rem, env(safe-area-inset-bottom))
+        max(1rem, env(safe-area-inset-left));
     }
 
     #overlay strong {
       color: #7ec8ff;
     }
 
-    canvas {
-      width: 100%;
-      height: 100%;
-      display: block;
+    #orientation {
+      opacity: 0.85;
+      font-size: 0.92rem;
     }
   </style>
 </head>
 
 <body>
+  <canvas id="splashparty-canvas"></canvas>
   <div id="overlay">
     <div><strong>WebGPU</strong> builds only — use a recent Chromium / Firefox nightly if this fails.</div>
     <div>Touch: left side move · right-third fire · drag elsewhere to look</div>
+    <div id="orientation"></div>
     <div id="status"></div>
   </div>
   <script type="module">
     const status = document.getElementById("status");
+    const orientation = document.getElementById("orientation");
+
+    const syncViewport = () => {
+      const viewportHeight = Math.round(window.visualViewport?.height ?? window.innerHeight);
+      document.documentElement.style.setProperty("--app-height", `${Math.max(viewportHeight, 1)}px`);
+    };
+
+    const syncOrientation = () => {
+      const portrait = window.matchMedia("(orientation: portrait)").matches;
+      orientation.textContent = `Screen: ${portrait ? "portrait" : "landscape"}`;
+    };
+
+    const onViewportChanged = () => {
+      syncViewport();
+      syncOrientation();
+    };
+
+    onViewportChanged();
+    window.addEventListener("resize", onViewportChanged, { passive: true });
+    window.addEventListener("orientationchange", onViewportChanged, { passive: true });
+    window.visualViewport?.addEventListener("resize", onViewportChanged, { passive: true });
+
     if (!("gpu" in navigator)) {
       status.textContent = "navigator.gpu is missing — update your browser.";
     } else {
