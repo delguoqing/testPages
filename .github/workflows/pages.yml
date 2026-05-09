@@ -1,3 +1,6 @@
+# 复制到「仅承载 GitHub Pages 的宿主仓库」：仓库根目录需有 static 内容目录 site/
+# 本文件在 SplashParty 仓内维护为模板；PushPlus 使用仓库 Secret：PUSHPLUS_TOKEN
+
 name: Deploy GitHub Pages (static site/)
 
 on:
@@ -29,9 +32,117 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
+
+  notify:
+    name: PushPlus + status JSON
+    needs: [build, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write status JSON to runner temp + workspace
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          PAGE_URL: ${{ needs.deploy.outputs.page_url }}
+        run: |
+          set -euo pipefail
+          NOTIFY_FILE="${RUNNER_TEMP}/pages-host-notify.json"
+          if [ "$BUILD_RESULT" = "success" ] && [ "$DEPLOY_RESULT" = "success" ]; then
+            OVERALL="success"
+          else
+            OVERALL="failure"
+          fi
+          jq -n \
+            --arg overall "$OVERALL" \
+            --arg repo "$REPO" \
+            --arg ref "$REF_NAME" \
+            --arg sha "$SHA" \
+            --arg build "$BUILD_RESULT" \
+            --arg deploy "$DEPLOY_RESULT" \
+            --arg run_url "$RUN_URL" \
+            --arg page_url "$PAGE_URL" \
+            --arg notify_path "$NOTIFY_FILE" \
+            '{overall: $overall, repo: $repo, ref: $ref, sha: $sha, build: $build, deploy: $deploy, run_url: $run_url, page_url: $page_url, notify_file: $notify_path}' \
+            >"$NOTIFY_FILE"
+          echo "状态 JSON（临时文件）: $NOTIFY_FILE"
+          cat "$NOTIFY_FILE"
+          cp "$NOTIFY_FILE" "$GITHUB_WORKSPACE/pages-host-notify.json"
+
+      - name: Upload status JSON artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pages-host-notify
+          path: pages-host-notify.json
+          if-no-files-found: error
+
+      - name: PushPlus（成功/失败均推送；失败不阻断 artifact）
+        if: always()
+        continue-on-error: true
+        env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          PAGE_URL: ${{ needs.deploy.outputs.page_url }}
+        run: |
+          if [ "$BUILD_RESULT" = "success" ] && [ "$DEPLOY_RESULT" = "success" ]; then
+            OVERALL="success"
+          else
+            OVERALL="failure"
+          fi
+          if [ -z "${PUSHPLUS_TOKEN:-}" ]; then
+            echo "PUSHPLUS_TOKEN 未配置，跳过 PushPlus"
+            exit 0
+          fi
+          NOTIFY_FILE="${RUNNER_TEMP}/pages-host-notify.json"
+          if [ "$OVERALL" = "success" ]; then
+            TITLE="SplashParty Pages 宿主：部署成功"
+          else
+            TITLE="SplashParty Pages 宿主：部署失败"
+          fi
+          if [ -n "$PAGE_URL" ]; then
+            PAGE_LINE="- 站点: [${PAGE_URL}](${PAGE_URL})"
+          else
+            PAGE_LINE="- 站点: （无 page_url）"
+          fi
+          CONTENT="## 静态站 \`site/\` 部署结果
+
+          **overall:** \`${OVERALL}\`
+
+          | job | 结果 |
+          |-----|------|
+          | build | ${BUILD_RESULT} |
+          | deploy | ${DEPLOY_RESULT} |
+
+          ${PAGE_LINE}
+
+          - 仓库: \`${REPO}\`
+          - 分支: \`${REF_NAME}\`
+          - 提交: \`${SHA}\`
+          - 临时状态文件（runner）: \`${NOTIFY_FILE}\`
+          - Artifact: \`pages-host-notify\` / \`pages-host-notify.json\`
+          - [查看 Run](${RUN_URL})"
+          jq -n \
+            --arg token "$PUSHPLUS_TOKEN" \
+            --arg title "$TITLE" \
+            --arg content "$CONTENT" \
+            '{token: $token, title: $title, content: $content, template: "markdown", channel: "wechat"}' \
+            | curl -sS -X POST "https://www.pushplus.plus/send" \
+              -H "Content-Type: application/json" \
+              -d @-
