@@ -1,0 +1,12 @@
+{
+  "name": "splashparty-web",
+  "private": true,
+  "description": "Headless console capture for wasm/WebGPU debugging (Playwright).",
+  "scripts": {
+    "capture-console": "node tools/capture-console.mjs",
+    "test:wasm-smoke": "node tools/wasm-smoke.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.52.0"
+  }
+}

@@ -77,6 +77,74 @@
     const status = document.getElementById("status");
     const orientation = document.getElementById("orientation");
 
+    /** Console ring buffer for agents / `npm run capture-console` (Playwright reads via evaluate). */
+    (function installConsoleTap() {
+      const MAX = 400;
+      const tap = [];
+      const stringify = (x) => {
+        if (x === null || x === undefined) return String(x);
+        if (typeof x === "string") return x;
+        if (typeof x === "number" || typeof x === "boolean" || typeof x === "bigint") return String(x);
+        if (x instanceof Error) return x.stack || x.message;
+        try {
+          return JSON.stringify(x);
+        } catch {
+          return String(x);
+        }
+      };
+      const record = (level, args) => {
+        tap.push({ t: Math.round(performance.now()), level, text: args.map(stringify).join(" ") });
+        if (tap.length > MAX) tap.splice(0, tap.length - MAX);
+        window.__SPLASHPARTY_CONSOLE__ = tap;
+      };
+      for (const level of ["log", "info", "warn", "error", "debug"]) {
+        const orig = console[level].bind(console);
+        console[level] = (...args) => {
+          try {
+            record(level, args);
+          } catch {
+            /* ignore */
+          }
+          orig(...args);
+        };
+      }
+    })();
+
+    /** Boot diagnostics: live in DevTools Console + `window.__SPLASHPARTY_BOOT__` (last 200). */
+    const BOOT_TAG = "[SplashParty boot]";
+    const BOOT_MAX = 200;
+    const bootEntries = [];
+    const bootLog = (phase, detail) => {
+      const entry = {
+        t: Math.round(performance.now()),
+        phase,
+        detail: detail === undefined ? null : detail,
+      };
+      bootEntries.push(entry);
+      if (bootEntries.length > BOOT_MAX) bootEntries.splice(0, bootEntries.length - BOOT_MAX);
+      window.__SPLASHPARTY_BOOT__ = bootEntries;
+      const suffix =
+        detail !== undefined && detail !== null && detail !== ""
+          ? typeof detail === "string"
+            ? ` ${detail}`
+            : ` ${JSON.stringify(detail)}`
+          : "";
+      console.info(BOOT_TAG, `${entry.t}ms`, phase + suffix);
+    };
+
+    bootLog("script module evaluating");
+    window.addEventListener(
+      "error",
+      (ev) => {
+        console.error(BOOT_TAG, "window error", ev.message, ev.error ?? ev.filename, ev.lineno, ev.colno);
+      },
+      { capture: true },
+    );
+    window.addEventListener("unhandledrejection", (ev) => {
+      const r = ev.reason;
+      console.error(BOOT_TAG, "unhandledrejection", r);
+    });
+
     const syncViewport = () => {
       const viewportHeight = Math.round(window.visualViewport?.height ?? window.innerHeight);
       document.documentElement.style.setProperty("--app-height", `${Math.max(viewportHeight, 1)}px`);
@@ -99,12 +167,110 @@
 
     if (!("gpu" in navigator)) {
       status.textContent = "navigator.gpu is missing — update your browser.";
+      bootLog("WebGPU missing", "navigator.gpu absent");
     } else {
       status.textContent = "Loading wasm…";
+      bootLog("WebGPU present", "navigator.gpu OK");
     }
-    const mod = await import("./dist/splashparty.js");
-    await mod.default();
+
+    (function installMappedAtCreationFallback() {
+      const params = new URLSearchParams(window.location.search);
+      const forceFallback = params.has("splashparty-force-buffer-shim");
+      const proto = window.GPUDevice?.prototype;
+      if (!proto?.createBuffer || proto.__splashpartyMappedAtCreationFallback) {
+        return;
+      }
+
+      const isMappedAtCreationRangeError = (e) =>
+        e instanceof RangeError &&
+        String(e.message || "").includes("mappedAtCreation") &&
+        String(e.message || "").includes("too large");
+
+      const originalCreateBuffer = proto.createBuffer;
+      Object.defineProperty(proto, "__splashpartyMappedAtCreationFallback", {
+        value: true,
+      });
+      proto.createBuffer = function createBufferWithMappedAtCreationFallback(desc) {
+        if (!desc?.mappedAtCreation) {
+          return originalCreateBuffer.call(this, desc);
+        }
+
+        try {
+          if (!forceFallback) {
+            return originalCreateBuffer.call(this, desc);
+          }
+        } catch (e) {
+          if (!isMappedAtCreationRangeError(e)) {
+            throw e;
+          }
+          console.warn(BOOT_TAG, "mappedAtCreation fallback active", e.message);
+        }
+
+        const buffer = originalCreateBuffer.call(this, { ...desc, mappedAtCreation: false });
+        const bytes = new ArrayBuffer(Number(desc.size || 0));
+        const nativeGetMappedRange = buffer.getMappedRange?.bind(buffer);
+        const nativeUnmap = buffer.unmap?.bind(buffer);
+        let mapped = true;
+
+        Object.defineProperty(buffer, "getMappedRange", {
+          configurable: true,
+          value(offset = 0, size) {
+            if (!mapped) {
+              throw new DOMException("Buffer is not mapped", "OperationError");
+            }
+            const start = Number(offset) || 0;
+            const length = size === undefined ? bytes.byteLength - start : Number(size);
+            if (start === 0 && length === bytes.byteLength) {
+              return bytes;
+            }
+            return bytes.slice(start, start + length);
+          },
+        });
+
+        Object.defineProperty(buffer, "unmap", {
+          configurable: true,
+          value: function () {
+            if (mapped) {
+              this.queue.writeBuffer(buffer, 0, new Uint8Array(bytes));
+              mapped = false;
+              if (nativeGetMappedRange) {
+                Object.defineProperty(buffer, "getMappedRange", {
+                  configurable: true,
+                  value: nativeGetMappedRange,
+                });
+              }
+              if (nativeUnmap) {
+                Object.defineProperty(buffer, "unmap", {
+                  configurable: true,
+                  value: nativeUnmap,
+                });
+              }
+            }
+          }.bind(this),
+        });
+
+        return buffer;
+      };
+    })();
+
+    try {
+      bootLog("dynamic import start", "./dist/splashparty.js");
+      const mod = await import("./dist/splashparty.js");
+      bootLog("dynamic import ok", Object.keys(mod).join(",") || "(no exports)");
+
+      bootLog("wasm default() start");
+      await mod.default();
+      bootLog("wasm default() returned");
+    } catch (e) {
+      console.error(BOOT_TAG, "bootstrap failed", e);
+      bootLog("bootstrap FAILED", String(e));
+      const msg = e && e.message ? String(e.message) : String(e);
+      status.textContent = `Boot error — see Console (${BOOT_TAG})`;
+      status.title = msg;
+      throw e;
+    }
     status.textContent = "";
+    bootLog("overlay status cleared", "ready");
   </script>
 </body>
 
