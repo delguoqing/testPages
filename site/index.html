@@ -62,6 +62,58 @@
       opacity: 0.85;
       font-size: 0.92rem;
     }
+
+    #load-panel {
+      display: none;
+      width: min(380px, 88vw);
+      flex-direction: column;
+      gap: 0.45rem;
+      align-items: stretch;
+      margin-top: 0.35rem;
+    }
+
+    #load-panel.visible {
+      display: flex;
+    }
+
+    #load-panel .load-line {
+      font-size: 0.88rem;
+      opacity: 0.92;
+      text-align: center;
+    }
+
+    #load-progress-track {
+      height: 7px;
+      border-radius: 4px;
+      background: rgba(255, 255, 255, 0.1);
+      overflow: hidden;
+    }
+
+    #load-progress-fill {
+      height: 100%;
+      width: 0%;
+      border-radius: 4px;
+      background: linear-gradient(90deg, #4a9eff, #7ec8ff);
+      transform-origin: left center;
+      transition: width 0.15s ease-out;
+    }
+
+    #load-progress-track.indeterminate #load-progress-fill {
+      width: 42%;
+      animation: load-bar-slide 1.05s ease-in-out infinite;
+    }
+
+    @keyframes load-bar-slide {
+
+      0%,
+      100% {
+        transform: translateX(-30%);
+      }
+
+      50% {
+        transform: translateX(190%);
+      }
+    }
   </style>
 </head>
 
@@ -72,10 +124,21 @@
     <div>Touch: left side move · right-third fire · drag elsewhere to look</div>
     <div id="orientation"></div>
     <div id="status"></div>
+    <div id="load-panel" aria-live="polite">
+      <div id="load-line" class="load-line"></div>
+      <div id="load-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div id="load-progress-fill"></div>
+      </div>
+    </div>
   </div>
   <script type="module">
     const status = document.getElementById("status");
     const orientation = document.getElementById("orientation");
+    const loadPanel = document.getElementById("load-panel");
+    const loadLine = document.getElementById("load-line");
+    const loadTrack = document.getElementById("load-progress-track");
+    const loadFill = document.getElementById("load-progress-fill");
+    const hasWebGpu = "gpu" in navigator;
 
     /** Console ring buffer for agents / `npm run capture-console` (Playwright reads via evaluate). */
     (function installConsoleTap() {
@@ -165,12 +228,66 @@
     window.addEventListener("orientationchange", onViewportChanged, { passive: true });
     window.visualViewport?.addEventListener("resize", onViewportChanged, { passive: true });
 
-    if (!("gpu" in navigator)) {
+    if (!hasWebGpu) {
       status.textContent = "navigator.gpu is missing — update your browser.";
       bootLog("WebGPU missing", "navigator.gpu absent");
     } else {
-      status.textContent = "Loading wasm…";
+      status.textContent = "";
       bootLog("WebGPU present", "navigator.gpu OK");
+    }
+
+    const setLoadProgress = (ratio, indeterminate) => {
+      loadTrack.classList.toggle("indeterminate", Boolean(indeterminate));
+      if (indeterminate) {
+        loadFill.style.width = "";
+        loadTrack.removeAttribute("aria-valuenow");
+        return;
+      }
+      const pct = Math.max(0, Math.min(100, Math.round(Number(ratio) * 100)));
+      loadFill.style.width = `${pct}%`;
+      loadTrack.setAttribute("aria-valuenow", String(pct));
+    };
+
+    const showLoadPanel = (message) => {
+      loadLine.textContent = message;
+      loadPanel.classList.add("visible");
+    };
+
+    const hideLoadPanel = () => {
+      loadPanel.classList.remove("visible");
+      loadTrack.classList.remove("indeterminate");
+      loadFill.style.width = "0%";
+      loadTrack.setAttribute("aria-valuenow", "0");
+    };
+
+    async function fetchWasmArrayBuffer(url, onProgress) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`WASM 请求失败：HTTP ${res.status}`);
+      const total = Number(res.headers.get("Content-Length") || 0) || 0;
+      const reader = res.body?.getReader();
+      if (!reader) {
+        const buf = await res.arrayBuffer();
+        onProgress(1, { received: buf.byteLength, total: buf.byteLength, knownTotal: true });
+        return buf;
+      }
+      const chunks = [];
+      let received = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.byteLength;
+        if (total > 0) onProgress(Math.min(1, received / total), { received, total, knownTotal: true });
+        else onProgress(-1, { received, total: 0, knownTotal: false });
+      }
+      const out = new Uint8Array(received);
+      let offset = 0;
+      for (const c of chunks) {
+        out.set(c, offset);
+        offset += c.byteLength;
+      }
+      onProgress(1, { received, total: total > 0 ? total : received, knownTotal: total > 0 });
+      return out.buffer;
     }
 
     (function installMappedAtCreationFallback() {
@@ -254,14 +371,42 @@
     })();
 
     try {
+      if (hasWebGpu) {
+        showLoadPanel("正在加载启动脚本…");
+        setLoadProgress(0, true);
+      }
       bootLog("dynamic import start", "./dist/splashparty.js");
       const mod = await import("./dist/splashparty.js");
       bootLog("dynamic import ok", Object.keys(mod).join(",") || "(no exports)");
 
-      bootLog("wasm default() start");
-      await mod.default();
-      bootLog("wasm default() returned");
+      if (hasWebGpu) {
+        const wasmUrl = new URL("./dist/splashparty_bg.wasm", import.meta.url).href;
+        bootLog("wasm fetch start", wasmUrl);
+        loadLine.textContent = "正在下载 WASM…";
+        setLoadProgress(0, true);
+        const wasmBuf = await fetchWasmArrayBuffer(wasmUrl, (ratio, meta) => {
+          if (meta.knownTotal && ratio >= 0 && ratio <= 1) {
+            setLoadProgress(ratio, false);
+            loadLine.textContent = `正在下载 WASM… ${Math.round(ratio * 100)}%`;
+          } else {
+            setLoadProgress(0, true);
+            const mb = (meta.received / (1024 * 1024)).toFixed(1);
+            loadLine.textContent = `正在下载 WASM… 已接收 ${mb} MB`;
+          }
+        });
+        bootLog("wasm fetch ok", wasmBuf.byteLength);
+        loadLine.textContent = "正在实例化 WebAssembly…（编译与启动）";
+        setLoadProgress(1, false);
+        bootLog("wasm default() start", "prefetched ArrayBuffer");
+        await mod.default({ module_or_path: wasmBuf });
+        bootLog("wasm default() returned");
+      } else {
+        bootLog("wasm default() start");
+        await mod.default();
+        bootLog("wasm default() returned");
+      }
     } catch (e) {
+      if (hasWebGpu) hideLoadPanel();
       console.error(BOOT_TAG, "bootstrap failed", e);
       bootLog("bootstrap FAILED", String(e));
       const msg = e && e.message ? String(e.message) : String(e);
@@ -269,6 +414,7 @@
       status.title = msg;
       throw e;
     }
+    if (hasWebGpu) hideLoadPanel();
     status.textContent = "";
     bootLog("overlay status cleared", "ready");
   </script>
