@@ -78,6 +78,9 @@ function isBenignConsoleError(text, locationUrl) {
   if (u.includes("favicon")) return true;
   const t = String(text).toLowerCase();
   if (t.includes("favicon") && (t.includes("404") || t.includes("not found"))) return true;
+  if ((u.endsWith(".meta") || t.includes(".meta")) && (t.includes("404") || t.includes("not found"))) {
+    return true;
+  }
   return false;
 }
 
